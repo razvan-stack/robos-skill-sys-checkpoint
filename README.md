@@ -19,6 +19,7 @@ Căile sunt cele din rădăcina robOS, deci folderele se copiază direct peste e
 | `scripts/checkpoint-reminder.js` | reminderul de checkpoint, trimite la skill |
 | `scripts/smoke-precompact.js` | test (36 de verificări) |
 | `scripts/smoke-checkpoint-reminder.js` | test (27 de verificări) |
+| `patches/robos-3.33.0-checkpoint.patch` | aceleași modificări ca patch, pentru robOS mai nou decât 3.33.0 |
 
 Față de versiunea livrată de robOS 3.27.0, aici sunt incluse trei modificări locale: blocul de
 checkpoint reinjectat după compactare, starea păstrată când sesiunea trece de miezul nopții și
@@ -31,8 +32,8 @@ corectura din Step 2 a skill-ului.
   `atomic-write.js`, `smoke-hook-sink.js`, plus `scripts/brain-ingest-reminder.js` (funcția
   `evaluateClose`) și `scripts/hook-user-prompt.js`.
 - În `.claude/settings.json`: `hook-precompact.js` înregistrat pe `PreCompact` (matcherele
-  `manual` și `auto`) și `checkpoint-reminder.js` înregistrat pe `Stop`. Pe un robOS
-  livrat standard sunt deja acolo.
+  `manual` și `auto`) și `checkpoint-reminder.js` înregistrat pe `Stop`. Pe laptop (3.33.0) sunt
+  acolo; pe alte versiuni le verifică pasul 5.
 
 ## Instalare
 
@@ -46,14 +47,43 @@ for f in skills/sys-checkpoint/SKILL.md scripts/hook-precompact.js scripts/lib/m
   [ -f "$f" ] && mkdir -p ".scratch/backup-sys-checkpoint/$(dirname "$f")" && cp "$f" ".scratch/backup-sys-checkpoint/$f"
 done
 
-# 2. aduce repo-ul și copiază fișierele peste rădăcină
+# 2. aduce repo-ul și versiunea robOS-ului țintă
 git clone https://github.com/razvan-stack/robos-skill-sys-checkpoint.git .scratch/sys-checkpoint-src
-cp -r .scratch/sys-checkpoint-src/skills .scratch/sys-checkpoint-src/scripts .
+cat VERSION
+```
 
-# 3. reindexează skill-urile (triggerele noi intră în router)
+Pasul 3 depinde de versiune.
+
+**Varianta A: robOS 3.27.0 – 3.33.0.** Fișierele se copiază întregi peste rădăcină:
+
+```bash
+cp -r .scratch/sys-checkpoint-src/skills .scratch/sys-checkpoint-src/scripts .
+```
+
+**Varianta B: robOS mai nou decât 3.33.0** (de exemplu serverul, pe 3.40.2). Nu copia scripturile
+întregi: ar înlocui codul nou al hook-urilor cu cel din 3.33.0 și ai pierde, fără să vezi, ce a
+schimbat robOS între timp. Copiezi doar fișierele care lipsesc acolo și aplici modificările ca
+patch:
+
+```bash
+mkdir -p skills/sys-checkpoint
+cp .scratch/sys-checkpoint-src/skills/sys-checkpoint/SKILL.md skills/sys-checkpoint/
+cp .scratch/sys-checkpoint-src/scripts/smoke-checkpoint-reminder.js scripts/
+git apply --check .scratch/sys-checkpoint-src/patches/robos-3.33.0-checkpoint.patch \
+  && git apply .scratch/sys-checkpoint-src/patches/robos-3.33.0-checkpoint.patch
+```
+
+Patch-ul conține tot ce s-a schimbat local în `hook-precompact.js`, `lib/memory-format.js`,
+`checkpoint-reminder.js` și `smoke-precompact.js` față de robOS 3.33.0. Testat: aplicat pe
+fișierele din 3.33.0, dă exact codul din repo. Netestat pe 3.40.2. Dacă `git apply --check` refuză,
+fișierele s-au schimbat prea mult între versiuni. Atunci nu forțezi: modificările se integrează de
+mână, cu patch-ul ca ghid.
+
+```bash
+# 4. reindexează skill-urile (triggerele noi intră în router)
 node scripts/rebuild-index.js
 
-# 4. verifică
+# 5. verifică
 node scripts/smoke-precompact.js
 node scripts/smoke-checkpoint-reminder.js
 grep -n "hook-precompact\|checkpoint-reminder" .claude/settings.json
@@ -61,16 +91,17 @@ grep -n "hook-precompact\|checkpoint-reminder" .claude/settings.json
 
 Ambele teste trebuie să se termine cu `GREEN`. Dacă un test pică pe un import, robOS-ul țintă e
 mai vechi decât modulul cerut: se actualizează robOS-ul întâi, nu se copiază module izolate.
+Dacă `grep` nu găsește unul dintre hook-uri, înregistrarea lui lipsește din `.claude/settings.json`
+și trebuie adăugată (`PreCompact` cu matcherele `manual` și `auto`, respectiv `Stop`).
 
 Sesiunile Claude Code deschise înainte de instalare se repornesc, ca hook-urile să ruleze codul
 nou.
 
 ## După un update de robOS
 
-`scripts/update.js` suprascrie `scripts/` și `skills/` cu versiunea livrată, deci poate readuce
-varianta fără aceste modificări. După update se reiau pașii 2–4 (cu `git pull` în
-`.scratch/sys-checkpoint-src`), apoi se compară cu ce a adus update-ul, ca să nu pierzi o
-schimbare nouă venită de la robOS.
+`scripts/update.js` suprascrie `scripts/` și `skills/` cu versiunea livrată, deci poate șterge
+aceste modificări. După update se reiau pașii 2–5 pe varianta B (`git pull` în
+`.scratch/sys-checkpoint-src` în loc de `git clone`).
 
 ## Dezactivare
 

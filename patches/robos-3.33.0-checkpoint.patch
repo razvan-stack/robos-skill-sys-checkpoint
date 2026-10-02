@@ -1,0 +1,424 @@
+diff --git a/scripts/checkpoint-reminder.js b/scripts/checkpoint-reminder.js
+index 5a9ffa4..6848437 100644
+--- a/scripts/checkpoint-reminder.js
++++ b/scripts/checkpoint-reminder.js
+@@ -157,7 +157,7 @@ async function main() {
+   // Reminder de memorie — calculat fara early-exit, ca sa se poata compune cu brainOut.
+   let memOut = null;
+   try {
+-    memOut = computeMemoryOutput(sessionId, now);
++    memOut = computeMemoryOutput(sessionId, now, payload.stop_hook_active === true);
+   } catch (e) {
+     logHookError('checkpoint-reminder:memory', e);
+   }
+@@ -171,8 +171,12 @@ async function main() {
+  * Calculeaza output-ul reminder-ului de memorie (sau null), fara sa scrie la stdout / iasa.
+  * Pastreaza logica de escaladare (counter unheeded) + reset cand memoria a fost scrisa.
+  */
+-function computeMemoryOutput(sessionId, now) {
++function computeMemoryOutput(sessionId, now, inContinuation = false) {
+   const thresholdMs = DEFAULT_THRESHOLD_MIN * 60 * 1000;
++  // Inside a Stop continuation (stop_hook_active, e.g. after hook-verify-claims.js), a soft nudge
++  // (levels 1-2) would re-open the turn once more; skip it WITHOUT counting it, so escalation state
++  // is unchanged. Level 3 keeps blocking every Stop, continuation or not (AUD-P1-04).
++  const softOnly = (st) => inContinuation && ((st.unheeded_count || 0) + 1) < 3;
+   const lastWrite = lastMemoryWriteMs();
+   const state = readCheckpointState(sessionId);
+ 
+@@ -197,6 +201,7 @@ function computeMemoryOutput(sessionId, now) {
+         // no memory written (AUD-P1-04). The anti-spam gate only throttles the
+         // soft nudges (levels 1-2).
+         if (overdue && ((st.unheeded_count || 0) >= 3 || (now - st.last_reminder_ms) > thresholdMs)) {
++          if (softOnly(st)) return null;
+           return buildMemoryReminder(sessionId, now, 'no_memory_file_yet', null, st);
+         }
+       } catch { /* noop */ }
+@@ -207,6 +212,7 @@ function computeMemoryOutput(sessionId, now) {
+   // Caz 2: memorie exista, dar nu a fost atinsa de >threshold
+   const sinceWrite = now - lastWrite;
+   if (sinceWrite > thresholdMs && ((st.unheeded_count || 0) >= 3 || (now - st.last_reminder_ms) > thresholdMs)) {
++    if (softOnly(st)) return null;
+     return buildMemoryReminder(sessionId, now, 'memory_stale', sinceWrite, st);
+   }
+   return null;
+@@ -250,7 +256,7 @@ function buildMemoryReminder(sessionId, now, reason, sinceWriteMs, state) {
+     // Block decision — Claude Code va impiedica modelul sa termine
+     return {
+       decision: 'block',
+-      reason: `${reasonText} This is the ${newCount}th unheeded reminder — the stop is blocked so you write today's memory NOW. Add the Goal/Deliverables/Decisions/Open Threads sections to ${memoryFileRel}, then continue. This block lifts automatically once the memory receives a write.${clientNotice ? ' ' + clientNotice : ''}`,
++      reason: `${reasonText} This is the ${newCount}th unheeded reminder — the stop is blocked so you write today's memory NOW. Add the Goal/Deliverables/Decisions/Open Threads sections to ${memoryFileRel}, then continue (for a full checkpoint follow \`skills/sys-checkpoint/SKILL.md\`). This block lifts automatically once the memory receives a write.${clientNotice ? ' ' + clientNotice : ''}`,
+     };
+   }
+ 
+@@ -264,6 +270,12 @@ function buildMemoryReminder(sessionId, now, reason, sinceWriteMs, state) {
+     '  - Add to `### Open Threads` what is unfinished',
+     '  - If the file does not exist, create it with the standard structure (## Session N → Goal/Deliverables/Decisions/Open Threads)',
+     '',
++    // The skill packages this same work, plus the categories that have no canonical
++    // section (literal facts, verifications, blockers, resume line) — and its block
++    // is what hook-precompact.js injects back after a compaction. Naming it here
++    // stops the model from improvising a thinner version of work that already exists.
++    'For a full checkpoint (before /compact, or when the session carries state worth restating), follow `skills/sys-checkpoint/SKILL.md` instead of improvising this list.',
++    '',
+   ];
+ 
+   if (newCount === 2) {
+@@ -286,7 +298,19 @@ function buildMemoryReminder(sessionId, now, reason, sinceWriteMs, state) {
+   };
+ }
+ 
+-main().catch((e) => {
+-  logHookError('checkpoint-reminder', e);
+-  process.exit(0);
+-});
++// Direct-run guard — acelasi contract ca in hook-user-prompt.js: hook-ul ruleaza
++// doar cand fisierul e invocat direct (asa il porneste Claude Code, exec form),
++// iar un import (smoke-checkpoint-reminder.js) capata functiile fara sa declanseze
++// fluxul real (citire stdin, scriere de state, stdout de hook).
++const __invokedFile = process.argv[1] && process.argv[1].replace(/\\/g, '/');
++const __thisFile = fileURLToPath(import.meta.url).replace(/\\/g, '/');
++if (__invokedFile === __thisFile) {
++  main().catch((e) => {
++    logHookError('checkpoint-reminder', e);
++    process.exit(0);
++  });
++}
++
++// Exportate pentru guard: textul reminderului e singurul canal prin care regula
++// ajunge la model, si pana acum nu-l verifica nimic.
++export { buildMemoryReminder, mergeOutputs, computeMemoryOutput };
+diff --git a/scripts/hook-precompact.js b/scripts/hook-precompact.js
+index 14152c7..e8701cd 100644
+--- a/scripts/hook-precompact.js
++++ b/scripts/hook-precompact.js
+@@ -25,7 +25,8 @@
+  *
+  *   Treapta 1 (acest script, la PreCompact): calculeaza determinist starea
+  *   ([COMPACT PRESERVATION]: branch git + fisiere necomise + calea memoriei
+- *   zilei + Open Threads curente) si o scrie intr-un flag file
++ *   zilei + Open Threads curente + ultimul bloc `### Checkpoint`) si o scrie
++ *   intr-un flag file
+  *   `data/session-state/{session_id}-precompact.json`. Zero stdout.
+  *
+  *   Treapta 2 (hook-user-prompt.js, UserPromptSubmit — eveniment care CHIAR
+@@ -42,14 +43,14 @@
+  * pornire). Pe sesiunile existente nu se aprinde retroactiv.
+  */
+ 
+-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
++import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
+ import { join, dirname } from 'path';
+ import { fileURLToPath } from 'url';
+ import { execSync } from 'child_process';
+ import { loadEnv } from './lib/env-loader.js';
+ import { logHookError } from './lib/hook-error-sink.js';
+ import { getMemoryDir, getActiveClient } from './lib/client-context.js';
+-import { extractOpenThreads, localDateISO } from './lib/memory-format.js';
++import { extractOpenThreads, extractLastCheckpoint, localDateISO } from './lib/memory-format.js';
+ import { readStdinWithTimeout, parseHookStdin } from './lib/read-stdin.js';
+ import { atomicWrite } from './lib/atomic-write.js';
+ 
+@@ -63,10 +64,8 @@ const SESSION_STATE_DIR = join(ROBOS_ROOT, 'data', 'session-state');
+ // componenta de nume de fisier, deci nu avem incredere in JSON extern.
+ const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+ 
+-function todayISO() {
+-  // Local day — memory files keyed on operator's calendar (AUD-P1-10).
+-  return localDateISO();
+-}
++// Ziua locala (AUD-P1-10) se rezolva prin localDateISO, direct in
++// resolveMemoryFile — singurul loc care mai are nevoie de ea.
+ 
+ /**
+  * Ruleaza o comanda git scurta, marginita la 2s, cu CWD=ROOT. Intoarce stdout
+@@ -85,6 +84,45 @@ function git(cmd) {
+   }
+ }
+ 
++// Fereastra in care fisierul de IERI mai conteaza pentru sesiunea curenta.
++// Cazul pe care il rezolva: sesiunea trece de miezul noptii (observat 2026-09-23,
++// 00:01) — memoria sesiunii e in fisierul de ieri, hook-ul cauta fisierul de azi,
++// care inca nu exista, si injecteaza un bloc fara fire si fara checkpoint exact
++// cand sesiunea e cea mai lunga si mai incarcata. Sase ore tin noaptea intreaga
++// si NU tarasc starea de ieri intr-o dimineata noua: la 9:00 fisierul de ieri e
++// vechi de mult mai mult, deci fallback-ul nu se aprinde.
++const MIDNIGHT_FALLBACK_MS = 6 * 60 * 60 * 1000;
++
++/**
++ * Alege fisierul de memorie din care se CITESTE starea (fire + checkpoint).
++ *
++ * Scrierile raman mereu pe fisierul zilei curente (`todayPath`) — fallback-ul e
++ * doar pentru citire, altfel o sesiune de noapte ar continua sa ingroape starea
++ * intr-o zi incheiata.
++ *
++ * @param {string} memoryDir directorul de memorie (root sau al clientului activ)
++ * @param {number} [now=Date.now()]
++ * @returns {{readPath: string|null, todayPath: string, fallback: boolean, fallbackDate: string|null}}
++ */
++export function resolveMemoryFile(memoryDir, now = Date.now()) {
++  const todayPath = join(memoryDir, `${localDateISO(new Date(now))}.md`);
++  if (existsSync(todayPath)) {
++    return { readPath: todayPath, todayPath, fallback: false, fallbackDate: null };
++  }
++
++  const prevDate = localDateISO(new Date(now - 24 * 60 * 60 * 1000));
++  const prevPath = join(memoryDir, `${prevDate}.md`);
++  if (existsSync(prevPath)) {
++    try {
++      if (now - statSync(prevPath).mtimeMs <= MIDNIGHT_FALLBACK_MS) {
++        return { readPath: prevPath, todayPath, fallback: true, fallbackDate: prevDate };
++      }
++    } catch { /* nefatal — tratam ca inexistent */ }
++  }
++
++  return { readPath: null, todayPath, fallback: false, fallbackDate: null };
++}
++
+ /**
+  * Construieste blocul [COMPACT PRESERVATION]. E citit de MODEL la primul prompt
+  * de dupa compactare (injectat de hook-user-prompt.js), nu de sumarizator —
+@@ -117,22 +155,49 @@ function buildPreservationContext(trigger) {
+   // 2) Memoria zilei + Open Threads (firele deschise = inregistrarea durabila)
+   const client = getActiveClient();
+   const memoryDir = getMemoryDir();
+-  const memoryPath = join(memoryDir, `${todayISO()}.md`);
++  const resolved = resolveMemoryFile(memoryDir);
++  const memoryPath = resolved.todayPath;
+   const memoryRel = memoryPath.slice(ROBOS_ROOT.length + 1).replace(/\\/g, '/');
++  const readRel = resolved.readPath
++    ? resolved.readPath.slice(ROBOS_ROOT.length + 1).replace(/\\/g, '/')
++    : null;
+   // client is the state OBJECT {slug,name,...} — use .slug, not the object
+   // (bare interpolation printed "[object Object]"; sibling of AUD-P1-01).
+   lines.push(`- Durable record: today's memory at \`${memoryRel}\`${client ? ` (active client: ${client.slug})` : ''}.`);
+ 
+-  if (existsSync(memoryPath)) {
++  if (resolved.fallback) {
++    lines.push(
++      `- NOTE: today's memory file does not exist yet (the session crossed midnight). ` +
++      `Threads and checkpoint below were read from \`${readRel}\` (${resolved.fallbackDate}). ` +
++      `New writes still go to \`${memoryRel}\`.`
++    );
++  }
++
++  let checkpoint = null;
++  if (resolved.readPath) {
+     try {
+-      const threads = extractOpenThreads(readFileSync(memoryPath, 'utf-8'));
++      const memoryContent = readFileSync(resolved.readPath, 'utf-8');
++      const threads = extractOpenThreads(memoryContent);
+       if (threads.length) {
+         lines.push('- Open Threads at compaction time (verify they survived in the summary):');
+         for (const t of threads.slice(0, 15)) lines.push(`    - ${t}`);
+       }
++      // Ultimul bloc `### Checkpoint HH:MM` — scris de skill-ul sys-checkpoint
++      // FIX de clasa (2026-09-22): categoriile fara sectiune canonica (fapte
++      // literale, ce a fost verificat si ce NU, blocaje, linia de reluare)
++      // traiau intr-un bloc pe care nimic nu-l mai citea — nici blocul asta,
++      // nici startup bundle-ul, nici memory-digest. Masurat pe 3 compactari
++      // reale: 0 din 3 reluari au deschis fisierul zilei ca sa-l recupereze.
++      checkpoint = extractLastCheckpoint(memoryContent, { maxChars: 2000 });
+     } catch { /* nefatal */ }
+   }
+ 
++  if (checkpoint) {
++    lines.push('');
++    lines.push(`- Last checkpoint written before compaction (\`### ${checkpoint.title}\`, from ${memoryRel}):`);
++    for (const l of checkpoint.body.split('\n')) lines.push(`    ${l}`);
++  }
++
+   // 3) Contractul: ce se pierde cel mai des la compactare (nu e in git/memorie)
+   lines.push('');
+   lines.push('If the summary lost any of the following, recover it before continuing:');
+@@ -200,7 +265,15 @@ async function main() {
+   process.exit(0);
+ }
+ 
+-main().catch((e) => {
+-  logHookError('hook-precompact', e);
+-  process.exit(0);
+-});
++// Direct-run guard — acelasi contract ca in hook-user-prompt.js si
++// checkpoint-reminder.js: hook-ul ruleaza doar invocat direct (asa il porneste
++// Claude Code, exec form), iar smoke-precompact.js poate importa
++// resolveMemoryFile fara sa declanseze fluxul real (stdin, scriere de flag).
++const __invokedFile = process.argv[1] && process.argv[1].replace(/\\/g, '/');
++const __thisFile = fileURLToPath(import.meta.url).replace(/\\/g, '/');
++if (__invokedFile === __thisFile) {
++  main().catch((e) => {
++    logHookError('hook-precompact', e);
++    process.exit(0);
++  });
++}
+diff --git a/scripts/lib/memory-format.js b/scripts/lib/memory-format.js
+index b6885f6..886208e 100644
+--- a/scripts/lib/memory-format.js
++++ b/scripts/lib/memory-format.js
+@@ -105,6 +105,49 @@ export function extractOpenThreads(content) {
+     .map((l) => l.replace(/^[-*]\s+/, ''));
+ }
+ 
++/**
++ * Extract the LAST `### Checkpoint HH:MM` block from a memory file.
++ *
++ * The sys-checkpoint skill writes the state that no hook can read from the
++ * conversation — literal facts (ids, urls, paths, numbers), what was verified
++ * and what was NOT, open blockers, and the resume line — into a block of its
++ * own, because those categories have no canonical section.
++ *
++ * Until this existed, that block was write-only: [COMPACT PRESERVATION] carried
++ * Open Threads but not the checkpoint, the startup bundle injects only the file
++ * path, and memory-digest skips it. Measured on 2026-09-22: 40% of that day's
++ * memory file was checkpoint blocks that nothing read back. hook-precompact.js
++ * now injects the last one after a compaction.
++ *
++ * @param {string} content
++ * @param {{maxChars?: number}} [opts] defensive cap on the returned body
++ * @returns {{title: string, body: string, truncated: boolean} | null}
++ */
++export function extractLastCheckpoint(content, opts = {}) {
++  if (typeof content !== 'string' || !content) return null;
++
++  const maxChars = Number.isFinite(opts.maxChars) && opts.maxChars > 0 ? opts.maxChars : 2000;
++  const matches = [...content.matchAll(/###\s+(Checkpoint[^\n]*)\n([\s\S]*?)(?=\n###|\n##|$)/gi)];
++  if (matches.length === 0) return null;
++
++  const last = matches[matches.length - 1];
++  const title = last[1].trim();
++  // Taie linia de inchidere a sesiunii: cand checkpointul e ultima sectiune a
++  // fisierului, `Session: N deliverables, M decisions` cade in corpul lui si ar
++  // ajunge in blocul injectat ca si cum ar fi un fapt de checkpoint.
++  let body = last[2]
++    .split('\n')
++    .filter((l) => !CLOSING_PATTERN.test(l))
++    .join('\n')
++    .trim();
++  if (!body) return null;
++
++  const truncated = body.length > maxChars;
++  if (truncated) body = `${body.slice(0, maxChars).trimEnd()}\n... (trunchiat — blocul complet e in fisierul zilei)`;
++
++  return { title, body, truncated };
++}
++
+ /**
+  * Required section headers that lint-memory enforces per session.
+  * Kept here so future schema changes (add a new required section)
+diff --git a/scripts/smoke-precompact.js b/scripts/smoke-precompact.js
+index 6d26bc4..fac61d6 100644
+--- a/scripts/smoke-precompact.js
++++ b/scripts/smoke-precompact.js
+@@ -24,11 +24,15 @@
+  */
+ 
+ import './lib/smoke-hook-sink.js'; // redirect hook sink so a standalone run does not pollute the production sink (review 2026-07-07)
+-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
++import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, mkdtempSync, utimesSync, rmSync } from 'node:fs';
+ import { join, dirname } from 'node:path';
++import { tmpdir } from 'node:os';
+ import { fileURLToPath } from 'node:url';
+ import { spawnSync } from 'node:child_process';
++import { resolveMemoryFile } from './hook-precompact.js';
+ import { consumeCompactRecovery } from './hook-user-prompt.js';
++import { extractLastCheckpoint, localDateISO } from './lib/memory-format.js';
++import { getMemoryDir } from './lib/client-context.js';
+ 
+ const __filename = fileURLToPath(import.meta.url);
+ const ROBOS_ROOT = join(dirname(__filename), '..');
+@@ -135,6 +139,96 @@ for (const trigger of ['manual', 'auto']) {
+   cleanFlag();
+ }
+ 
++// 3.5 CHECKPOINT — ultimul bloc `### Checkpoint HH:MM` ajunge in blocul injectat.
++// Unitar (offline, independent de starea memoriei de pe disc) + o verificare pe
++// rularea reala de mai sus, conditionata de existenta unui bloc in fisierul zilei.
++{
++  const SAMPLE = [
++    '## Session 1', '', '### Open Threads', '- fir vechi', '',
++    '### Checkpoint 09:00', '', '**Fapte literale**', '- id vechi ABC', '',
++    '### Checkpoint 23:23', '', '**Fapte literale**', '- id nou XYZ-999', '',
++    '**Verificari**', '- `node scripts/smoke-x.js`: pass', '',
++    '**Reluare:** continua cu pasul 2', '', 'Session: 1 deliverables, 1 decisions', '',
++  ].join('\n');
++
++  const cp = extractLastCheckpoint(SAMPLE);
++  check('extractLastCheckpoint: ia ULTIMUL bloc, nu primul', !!cp && cp.body.includes('XYZ-999') && !cp.body.includes('ABC'), cp && cp.title);
++  check('extractLastCheckpoint: pastreaza titlul cu ora', !!cp && cp.title === 'Checkpoint 23:23', cp && cp.title);
++  check('extractLastCheckpoint: se opreste inainte de linia de inchidere', !!cp && !cp.body.includes('Session: 1 deliverables'));
++  check('extractLastCheckpoint: pastreaza linia de Reluare', !!cp && cp.body.includes('Reluare'));
++  check('extractLastCheckpoint: fara bloc → null', extractLastCheckpoint('## Session 1\n\n### Open Threads\n- x') === null);
++  check('extractLastCheckpoint: input invalid → null', extractLastCheckpoint(null) === null && extractLastCheckpoint('') === null);
++
++  const capped = extractLastCheckpoint(`### Checkpoint 10:00\n${'- linie lunga\n'.repeat(400)}`, { maxChars: 500 });
++  check('extractLastCheckpoint: plafoneaza si marcheaza trunchierea', !!capped && capped.truncated && capped.body.length < 700, capped && capped.body.length);
++
++  // Pe rularea reala: DACA memoria zilei are un bloc de checkpoint, blocul
++  // injectat trebuie sa-l contina. Pe o instalare proaspata (fara checkpoint)
++  // verificarea se declara skip, nu fail — altfel guard-ul ar fi verde/rosu
++  // dupa starea zilei, nu dupa cod.
++  cleanFlag();
++  runHook({ session_id: SID, trigger: 'manual' });
++  let injected = '';
++  try { injected = JSON.parse(readFileSync(FLAG, 'utf-8')).context || ''; } catch { /* gol */ }
++  const memFile = join(getMemoryDir(), `${localDateISO()}.md`);
++  const memHasCheckpoint = existsSync(memFile) && /###\s+Checkpoint/i.test(readFileSync(memFile, 'utf-8'));
++  if (memHasCheckpoint) {
++    check('rulare reala: blocul injectat contine ultimul checkpoint', /Last checkpoint written before compaction/.test(injected));
++  } else {
++    console.log('  SKIP  rulare reala: memoria zilei nu are inca bloc de checkpoint');
++  }
++  cleanFlag();
++}
++
++// 3.6 MIEZUL NOPTII — cand fisierul zilei nu exista inca, starea se citeste din
++// fisierul de IERI, dar DOAR cat timp e proaspat. Scenarii pe un director temporar,
++// ca rezultatul sa nu depinda de starea reala a memoriei.
++{
++  const tmp = mkdtempSync(join(tmpdir(), 'robos-precompact-'));
++  const dayMs = 24 * 60 * 60 * 1000;
++  const now = Date.now();
++  const today = localDateISO(new Date(now));
++  const yday = localDateISO(new Date(now - dayMs));
++  const fileFor = (d) => join(tmp, `${d}.md`);
++
++  // a) fisierul de azi exista → se citeste el, fara fallback
++  writeFileSync(fileFor(today), '## Session 1\n\n### Open Threads\n- de azi\n', 'utf-8');
++  writeFileSync(fileFor(yday), '## Session 9\n\n### Open Threads\n- de ieri\n', 'utf-8');
++  let r = resolveMemoryFile(tmp, now);
++  check('miezul noptii: fisierul de azi exista → fara fallback', r.readPath === fileFor(today) && r.fallback === false, r.readPath);
++
++  // b) azi lipseste, ieri e proaspat (scris acum 10 minute) → fallback
++  unlinkSync(fileFor(today));
++  utimesSync(fileFor(yday), new Date(now - 10 * 60 * 1000), new Date(now - 10 * 60 * 1000));
++  r = resolveMemoryFile(tmp, now);
++  check('miezul noptii: azi lipseste + ieri proaspat → fallback pe ieri', r.readPath === fileFor(yday) && r.fallback === true && r.fallbackDate === yday, JSON.stringify(r));
++  check('miezul noptii: scrierile raman pe fisierul de AZI', r.todayPath === fileFor(today), r.todayPath);
++
++  // c) azi lipseste, ieri e vechi (10 ore) → FARA fallback: e o zi noua, nu o
++  //    sesiune care a trecut de miezul noptii. Altfel dimineata ai primi in
++  //    context starea de ieri ca si cum ar fi curenta.
++  utimesSync(fileFor(yday), new Date(now - 10 * 3600 * 1000), new Date(now - 10 * 3600 * 1000));
++  r = resolveMemoryFile(tmp, now);
++  check('zi noua: ieri vechi de 10h → fara fallback', r.readPath === null && r.fallback === false, JSON.stringify(r));
++
++  // d) director gol → readPath null, fara exceptie
++  unlinkSync(fileFor(yday));
++  r = resolveMemoryFile(tmp, now);
++  check('memorie inexistenta → readPath null, fara exceptie', r.readPath === null && !!r.todayPath);
++
++  // e) checkpointul de ieri chiar ajunge in bloc prin fallback
++  writeFileSync(fileFor(yday), [
++    '## Session 9', '', '### Open Threads', '- fir de ieri', '',
++    '### Checkpoint 23:59', '', '**Fapte literale**', '- id de ieri QWE-777', '',
++  ].join('\n'), 'utf-8');
++  utimesSync(fileFor(yday), new Date(now - 5 * 60 * 1000), new Date(now - 5 * 60 * 1000));
++  r = resolveMemoryFile(tmp, now);
++  const cpYday = r.readPath ? extractLastCheckpoint(readFileSync(r.readPath, 'utf-8')) : null;
++  check('fallback: checkpointul de ieri e citibil prin readPath', !!cpYday && cpYday.body.includes('QWE-777'), r.readPath);
++
++  rmSync(tmp, { recursive: true, force: true });
++}
++
+ // 4. ANTI-HANG — fara stdin (input gol). Trebuie sa iasa 0 prompt, fara sa atarne.
+ {
+   const res = runHook(null);
