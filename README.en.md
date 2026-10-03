@@ -88,7 +88,7 @@ The script does the following by itself:
 1. Checks that it runs in the robOS root and that the version is at least 3.27.0.
 2. Backs up every file it may change into `.scratch/backup-sys-checkpoint/<date-time>/`.
 3. Brings the hooks up to date, depending on what it finds:
-   - **changes already present** (recent robOS): changes nothing;
+   - **changes already present** (for example on a second run): changes nothing;
    - **the patch applies**: applies it;
    - **robOS 3.27.0 – 3.33.0**: copies the hook files whole;
    - **otherwise**: stops without modifying anything (see below).
@@ -183,8 +183,8 @@ follows them in any language.
 
 ## What was tested
 
-On 3 October 2026, `install.sh` ran on a copy of robOS 3.40.17 in six situations: hooks already up
-to date (installs only the skill), hooks without the changes (applies the patch), a second run
+On 3 October 2026, `install.sh` ran on a copy of robOS 3.40.17 in six situations: hooks already
+changed (installs only the skill), hooks without the changes, as on a fresh install (applies the patch), a second run
 (changes nothing), a version that is too old, a missing hook registration, and running from the
 wrong folder. All behaved as described above and the tests came out `GREEN`. The patch had earlier
 been checked against the robOS 3.33.0 files. Copying whole files for robOS 3.27.0 – 3.32.x has not

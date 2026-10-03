@@ -89,7 +89,7 @@ Scriptul face singur următorii pași:
 2. Face o copie de siguranță a fișierelor pe care le poate schimba, în
    `.scratch/backup-sys-checkpoint/<data-ora>/`.
 3. Aduce hook-urile la zi, după ce găsește:
-   - **modificările sunt deja acolo** (robOS-urile recente): nu schimbă nimic;
+   - **modificările sunt deja acolo** (de exemplu la a doua rulare): nu schimbă nimic;
    - **patch-ul se aplică**: îl aplică;
    - **robOS 3.27.0 – 3.33.0**: copiază fișierele hook-urilor întregi;
    - **altfel**: se oprește fără să modifice nimic (vezi mai jos).
@@ -184,7 +184,7 @@ corectură în pasul 2 al skill-ului.
 ## Ce a fost testat
 
 Pe 3 octombrie 2026, `install.sh` a rulat pe o copie a robOS 3.40.17 în șase situații: hook-urile
-deja la zi (instalează doar skill-ul), hook-urile fără modificări (aplică patch-ul), a doua rulare
+deja modificate (instalează doar skill-ul), hook-urile fără modificări, ca la o instalare nouă (aplică patch-ul), a doua rulare
 (nu schimbă nimic), versiune prea veche, hook neînregistrat și rulare din alt folder. Toate s-au
 comportat ca mai sus, iar testele au ieșit `GREEN`. Patch-ul a fost verificat anterior pe fișierele
 din robOS 3.33.0. Copierea fișierelor întregi pentru robOS 3.27.0 – 3.32.x n-a fost testată pe
